@@ -187,12 +187,29 @@ struct GameInfo: Identifiable, Equatable {
     let heroBannerUrl: String?
     var isInLibrary: Bool
     var variants: [GameVariant]
+
+    /// Whether this game belongs under a store filter. Owned games match only the store they're
+    /// owned through; unowned catalog games match any store they're available on.
+    func matchesStore(_ store: String) -> Bool {
+        if isInLibrary {
+            return variants.contains { $0.appStore == store && $0.isOwned }
+        }
+        return variants.contains { $0.appStore == store }
+    }
+
+    /// Stores this game is owned through (drives the Library filter chips).
+    var ownedStores: [String] {
+        variants.filter { $0.isOwned }.map { $0.appStore }
+    }
 }
 
 struct GameVariant: Equatable {
     let id: String
     let appStore: String
     var appId: String?
+    /// True when this variant is the one in the GFN library (`gfn.library.selected`) —
+    /// i.e. the store the game is owned through.
+    var isOwned: Bool = false
 
     var storeName: String {
         switch appStore {
