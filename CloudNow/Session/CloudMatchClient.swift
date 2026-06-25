@@ -286,7 +286,7 @@ actor CloudMatchClient {
             print("[CloudMatch] createSession response: HTTP \(statusCode)")
             if statusCode == 200 {
                 let payload = try JSONDecoder().decode(CloudMatchResponse.self, from: data)
-                return try toSessionInfo(base: base, payload: payload, rawData: data, clientId: clientId, deviceId: deviceId)
+                return try toSessionInfo(base: base, routingZoneUrl: nil, payload: payload, rawData: data, clientId: clientId, deviceId: deviceId)
             }
             let raw = String(data: data, encoding: .utf8) ?? ""
             print("[CloudMatch] createSession failed: HTTP \(statusCode) body: \(raw.prefix(500))")
