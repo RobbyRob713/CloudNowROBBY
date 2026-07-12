@@ -79,19 +79,19 @@ enum KeychainService {
     private static let account = "gfn-auth-session"
 
     static func save(_ data: Data) throws {
-        let query: [CFString: Any] = [
-            kSecClass: kSecClassGenericPassword,
-            kSecAttrService: service,
-            kSecAttrAccount: account,
-        ]
-        SecItemDelete(query as CFDictionary)
-        let attrs: [CFString: Any] = [
-            kSecClass: kSecClassGenericPassword,
-            kSecAttrService: service,
-            kSecAttrAccount: account,
+        let query = keychainQuery()
+        let updateAttrs: [CFString: Any] = [
             kSecValueData: data,
-            kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlock,
         ]
+        let updateStatus = SecItemUpdate(query as CFDictionary, updateAttrs as CFDictionary)
+        if updateStatus == errSecSuccess { return }
+        guard updateStatus == errSecItemNotFound else {
+            throw KeychainError.saveFailed(updateStatus)
+        }
+
+        var attrs = query
+        attrs[kSecValueData] = data
+        attrs[kSecAttrAccessible] = kSecAttrAccessibleAfterFirstUnlock
         let status = SecItemAdd(attrs as CFDictionary, nil)
         guard status == errSecSuccess else {
             throw KeychainError.saveFailed(status)
@@ -99,13 +99,9 @@ enum KeychainService {
     }
 
     static func load() throws -> Data {
-        let query: [CFString: Any] = [
-            kSecClass: kSecClassGenericPassword,
-            kSecAttrService: service,
-            kSecAttrAccount: account,
-            kSecReturnData: true,
-            kSecMatchLimit: kSecMatchLimitOne,
-        ]
+        var query = keychainQuery()
+        query[kSecReturnData] = true
+        query[kSecMatchLimit] = kSecMatchLimitOne
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         guard status == errSecSuccess, let data = result as? Data else {
@@ -115,12 +111,20 @@ enum KeychainService {
     }
 
     static func delete() {
-        let query: [CFString: Any] = [
+        let query = keychainQuery()
+        SecItemDelete(query as CFDictionary)
+    }
+
+    private static func keychainQuery() -> [CFString: Any] {
+        var query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecAttrAccount: account,
         ]
-        SecItemDelete(query as CFDictionary)
+        if #available(tvOS 13.0, *) {
+            query[kSecUseDataProtectionKeychain] = true
+        }
+        return query
     }
 
     enum KeychainError: Error {
@@ -187,7 +191,8 @@ actor NVIDIAAuthAPI {
     func fetchProviders() async throws -> [LoginProvider] {
         var request = URLRequest(url: URL(string: NVIDIAAuth.serviceUrlsEndpoint)!)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        let (data, _) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request)
+        try validateHTTPStatus(response, data: data, error: AuthError.deviceFlowFailed)
         let payload = try JSONDecoder().decode(ServiceUrlsResponse.self, from: data)
         let endpoints = payload.gfnServiceInfo?.gfnServiceEndpoints ?? []
         return endpoints.map { entry in
@@ -210,12 +215,14 @@ actor NVIDIAAuthAPI {
         request.setValue("https://nvfile", forHTTPHeaderField: "Origin")
         request.setValue("https://nvfile/", forHTTPHeaderField: "Referer")
         request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
-        let body = "grant_type=authorization_code&code=\(code)&redirect_uri=\(redirectURI.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? redirectURI)&code_verifier=\(verifier)"
-        request.httpBody = body.data(using: .utf8)
+        request.httpBody = formBody([
+            URLQueryItem(name: "grant_type", value: "authorization_code"),
+            URLQueryItem(name: "code", value: code),
+            URLQueryItem(name: "redirect_uri", value: redirectURI),
+            URLQueryItem(name: "code_verifier", value: verifier),
+        ])
         let (data, response) = try await session.data(for: request)
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-            throw AuthError.tokenExchangeFailed(String(data: data, encoding: .utf8) ?? "")
-        }
+        try validateHTTPStatus(response, data: data, error: AuthError.tokenExchangeFailed)
         return try parseTokenResponse(data)
     }
 
@@ -230,7 +237,11 @@ actor NVIDIAAuthAPI {
         // Trying the wrong clientID first risks NVIDIA revoking a single-use refresh token
         // on the failed attempt, leaving nothing for the correct retry.
         for clientID in [NVIDIAAuth.deviceFlowClientID, NVIDIAAuth.clientID] {
-            request.httpBody = "grant_type=refresh_token&refresh_token=\(refreshToken)&client_id=\(clientID)".data(using: .utf8)
+            request.httpBody = formBody([
+                URLQueryItem(name: "grant_type", value: "refresh_token"),
+                URLQueryItem(name: "refresh_token", value: refreshToken),
+                URLQueryItem(name: "client_id", value: clientID),
+            ])
             let (data, response) = try await session.data(for: request)
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             authLog.debug("[Auth] refreshTokens with clientID=\(clientID.prefix(8), privacy: .public)… → HTTP \(statusCode, privacy: .public)")
@@ -238,7 +249,7 @@ actor NVIDIAAuthAPI {
                 return try parseTokenResponse(data)
             }
             if statusCode < 400 || statusCode >= 500 {
-                throw AuthError.tokenRefreshFailed(String(data: data, encoding: .utf8) ?? "HTTP \(statusCode)")
+                throw AuthError.tokenRefreshFailed(sanitizedHTTPError(statusCode: statusCode, data: data))
             }
         }
         throw AuthError.tokenRefreshFailed("Refresh token rejected by all known client IDs.")
@@ -252,11 +263,7 @@ actor NVIDIAAuthAPI {
         request.setValue("https://nvfile", forHTTPHeaderField: "Origin")
         request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
         let (data, response) = try await session.data(for: request)
-        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard statusCode == 200 else {
-            let body = String(data: data, encoding: .utf8) ?? "(empty)"
-            throw AuthError.clientTokenFailed("HTTP \(statusCode): \(body)")
-        }
+        try validateHTTPStatus(response, data: data, error: AuthError.clientTokenFailed)
         let payload = try JSONDecoder().decode(ClientTokenResponse.self, from: data)
         let expiresAt = Date().addingTimeInterval(TimeInterval(payload.expires_in ?? 86400))
         return (payload.client_token, expiresAt)
@@ -277,13 +284,16 @@ actor NVIDIAAuthAPI {
         // which step of the login flow succeeded.
         var lastError: Error = AuthError.clientTokenFailed("No client IDs tried")
         for clientID in [NVIDIAAuth.clientID, NVIDIAAuth.deviceFlowClientID] {
-            let body = "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Aclient_token&client_token=\(clientToken)&client_id=\(clientID)&sub=\(userId)"
-            request.httpBody = body.data(using: .utf8)
+            request.httpBody = formBody([
+                URLQueryItem(name: "grant_type", value: "urn:ietf:params:oauth:grant-type:client_token"),
+                URLQueryItem(name: "client_token", value: clientToken),
+                URLQueryItem(name: "client_id", value: clientID),
+                URLQueryItem(name: "sub", value: userId),
+            ])
             let (data, response) = try await session.data(for: request)
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             if statusCode == 200 { return try parseTokenResponse(data) }
-            let responseBody = String(data: data, encoding: .utf8) ?? "(empty)"
-            lastError = AuthError.clientTokenFailed("HTTP \(statusCode): \(responseBody)")
+            lastError = AuthError.clientTokenFailed(sanitizedHTTPError(statusCode: statusCode, data: data))
             if statusCode < 400 || statusCode >= 500 { throw lastError }
             // 4xx with clientID mismatch → try next clientID
         }
@@ -297,15 +307,18 @@ actor NVIDIAAuthAPI {
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        var params = "client_id=\(NVIDIAAuth.deviceFlowClientID)&scope=\(NVIDIAAuth.scopes.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? NVIDIAAuth.scopes)&device_id=\(UUID().uuidString)&display_name=Apple%20TV"
+        var params = [
+            URLQueryItem(name: "client_id", value: NVIDIAAuth.deviceFlowClientID),
+            URLQueryItem(name: "scope", value: NVIDIAAuth.scopes),
+            URLQueryItem(name: "device_id", value: UUID().uuidString),
+            URLQueryItem(name: "display_name", value: "Apple TV"),
+        ]
         if let idpId {
-            params += "&idp_id=\(idpId)"
+            params.append(URLQueryItem(name: "idp_id", value: idpId))
         }
-        request.httpBody = params.data(using: .utf8)
+        request.httpBody = formBody(params)
         let (data, response) = try await session.data(for: request)
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-            throw AuthError.deviceFlowFailed(String(data: data, encoding: .utf8) ?? "")
-        }
+        try validateHTTPStatus(response, data: data, error: AuthError.deviceFlowFailed)
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         return try decoder.decode(DeviceFlowResponse.self, from: data)
@@ -324,8 +337,11 @@ actor NVIDIAAuthAPI {
             request.httpMethod = "POST"
             request.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
             request.setValue("application/json", forHTTPHeaderField: "Accept")
-            let body = "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code&device_code=\(deviceCode)&client_id=\(NVIDIAAuth.deviceFlowClientID)"
-            request.httpBody = body.data(using: .utf8)
+            request.httpBody = formBody([
+                URLQueryItem(name: "grant_type", value: "urn:ietf:params:oauth:grant-type:device_code"),
+                URLQueryItem(name: "device_code", value: deviceCode),
+                URLQueryItem(name: "client_id", value: NVIDIAAuth.deviceFlowClientID),
+            ])
             let (data, response) = try await session.data(for: request)
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
@@ -346,9 +362,10 @@ actor NVIDIAAuthAPI {
                 case "access_denied":
                     throw AuthError.deviceFlowDenied
                 default:
-                    throw AuthError.deviceFlowFailed(errorResp.errorDescription ?? errorResp.error)
+                    throw AuthError.deviceFlowFailed(sanitizeAuthMessage(errorResp.errorDescription ?? errorResp.error))
                 }
             }
+            throw AuthError.deviceFlowFailed(sanitizedHTTPError(statusCode: statusCode, data: data))
         }
         throw AuthError.deviceFlowExpired
     }
@@ -363,7 +380,8 @@ actor NVIDIAAuthAPI {
         var request = URLRequest(url: URL(string: NVIDIAAuth.userinfoEndpoint)!)
         request.setValue("Bearer \(tokens.accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("https://nvfile", forHTTPHeaderField: "Origin")
-        let (data, _) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request)
+        try validateHTTPStatus(response, data: data, error: AuthError.tokenExchangeFailed)
         let payload = try JSONDecoder().decode(UserinfoResponse.self, from: data)
         return AuthUser(
             userId: payload.sub,
@@ -375,6 +393,29 @@ actor NVIDIAAuthAPI {
     }
 
     // MARK: Private Helpers
+
+    nonisolated func formBody(_ items: [URLQueryItem]) -> Data {
+        var components = URLComponents()
+        components.queryItems = items
+        return Data((components.percentEncodedQuery ?? "").utf8)
+    }
+
+    private nonisolated func validateHTTPStatus(
+        _ response: URLResponse,
+        data: Data,
+        error: (String) -> AuthError
+    ) throws {
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+        guard (200 ... 299).contains(statusCode) else {
+            throw error(sanitizedHTTPError(statusCode: statusCode, data: data))
+        }
+    }
+
+    private nonisolated func sanitizedHTTPError(statusCode: Int, data: Data) -> String {
+        let raw = String(data: data.prefix(4096), encoding: .utf8) ?? ""
+        let sanitized = sanitizeAuthMessage(raw)
+        return sanitized.isEmpty ? "HTTP \(statusCode)" : "HTTP \(statusCode): \(sanitized)"
+    }
 
     private func parseTokenResponse(_ data: Data) throws -> AuthTokens {
         let payload = try JSONDecoder().decode(TokenResponse.self, from: data)
@@ -487,13 +528,39 @@ enum AuthError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .noAuthCode: "No authorization code received."
-        case let .tokenExchangeFailed(msg): "Token exchange failed: \(msg)"
-        case let .tokenRefreshFailed(msg): "Token refresh failed: \(msg)"
-        case let .clientTokenFailed(msg): "Failed to obtain client token: \(msg)"
+        case let .tokenExchangeFailed(msg): "Token exchange failed: \(sanitizeAuthMessage(msg))"
+        case let .tokenRefreshFailed(msg): "Token refresh failed: \(sanitizeAuthMessage(msg))"
+        case let .clientTokenFailed(msg): "Failed to obtain client token: \(sanitizeAuthMessage(msg))"
         case .noSession: "No authenticated session."
-        case let .deviceFlowFailed(msg): "Device login failed: \(msg)"
+        case let .deviceFlowFailed(msg): "Device login failed: \(sanitizeAuthMessage(msg))"
         case .deviceFlowExpired: "Login code expired. Please try again."
         case .deviceFlowDenied: "Login was denied."
         }
     }
+}
+
+func sanitizeAuthMessage(_ message: String) -> String {
+    var output = message
+    let tokenPatterns = [
+        #""(access_token|refresh_token|id_token|client_token)"\s*:\s*"[^"]+""#,
+        #"(accessToken|refreshToken|idToken|clientToken)"\s*:\s*"[^"]+""#,
+        #"(Authorization)"\s*:\s*"[^"]+""#,
+        #"(?i)(access_token|refresh_token|id_token|client_token|accessToken|refreshToken|idToken|clientToken)=([^&\s]+)"#,
+    ]
+    for pattern in tokenPatterns {
+        output = output.replacingOccurrences(
+            of: pattern,
+            with: "$1=<redacted>",
+            options: .regularExpression
+        )
+    }
+    output = output.replacingOccurrences(
+        of: #"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"#,
+        with: "<redacted-jwt>",
+        options: .regularExpression
+    )
+    if output.count > 500 {
+        output = String(output.prefix(500)) + "..."
+    }
+    return output
 }

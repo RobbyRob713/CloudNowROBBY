@@ -191,6 +191,15 @@ final class AuthManager {
         }
     }
 
+    func refreshForBackgroundTask() async throws {
+        guard let s = session else { throw AuthError.noSession }
+        if s.tokens.isNearExpiry {
+            let refreshed = try await refresh(session: s)
+            session = refreshed
+            try persist(refreshed)
+        }
+    }
+
     private func refresh(session s: AuthSession) async throws -> AuthSession {
         // Coalesce: if a refresh is already in-flight, wait for it instead of
         // starting a second one (which would try to use an already-rotated token).

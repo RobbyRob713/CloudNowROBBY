@@ -22,9 +22,17 @@ struct CloudNowApp: App {
             using: nil
         ) { [authManager] task in
             Task { @MainActor in
-                await authManager.refreshIfNeeded()
-                authManager.scheduleBackgroundRefresh()
-                task.setTaskCompleted(success: true)
+                var succeeded = false
+                defer {
+                    authManager.scheduleBackgroundRefresh()
+                    task.setTaskCompleted(success: succeeded)
+                }
+                do {
+                    try await authManager.refreshForBackgroundTask()
+                    succeeded = true
+                } catch {
+                    succeeded = false
+                }
             }
         }
     }

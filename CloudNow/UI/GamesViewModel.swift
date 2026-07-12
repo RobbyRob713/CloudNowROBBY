@@ -66,6 +66,31 @@ struct LastSessionRecord: Codable {
         deviceId = try c.decodeIfPresent(String.self, forKey: .deviceId)
         createdAt = try c.decode(Date.self, forKey: .createdAt)
     }
+
+    var validatedForReuse: LastSessionRecord? {
+        guard !sessionId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !serverIp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !appId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let normalizedBase = CloudMatchURLBuilder.normalizedBase(base),
+              let baseHost = URLComponents(string: normalizedBase)?.host,
+              CloudMatchURLBuilder.isCloudMatchHost(baseHost)
+        else {
+            return nil
+        }
+        if routingZoneUrl != nil, CloudMatchURLBuilder.normalizedZoneURL(routingZoneUrl) == nil {
+            return nil
+        }
+        return LastSessionRecord(
+            sessionId: sessionId,
+            serverIp: serverIp,
+            appId: appId,
+            base: normalizedBase,
+            routingZoneUrl: CloudMatchURLBuilder.normalizedZoneURL(routingZoneUrl),
+            clientId: clientId,
+            deviceId: deviceId,
+            createdAt: createdAt
+        )
+    }
 }
 
 @Observable
@@ -126,12 +151,13 @@ class GamesViewModel {
         if let data = UserDefaults.standard.data(forKey: "gfn.streamSettings"),
            let settings = try? JSONDecoder().decode(StreamSettings.self, from: data)
         {
-            streamSettings = settings
+            streamSettings = settings.normalizedForClient
         }
-        if let data = UserDefaults.standard.data(forKey: "gfn.lastSession"),
-           let session = try? JSONDecoder().decode(LastSessionRecord.self, from: data)
-        {
-            lastSession = session
+        if let data = UserDefaults.standard.data(forKey: "gfn.lastSession") {
+            lastSession = (try? JSONDecoder().decode(LastSessionRecord.self, from: data))?.validatedForReuse
+        }
+        if lastSession == nil {
+            UserDefaults.standard.removeObject(forKey: "gfn.lastSession")
         }
         // tvOS currently caps at 60 Hz; clamp any saved value to the screen maximum.
         // If Apple raises the cap in a future tvOS release this will automatically unlock.
@@ -435,11 +461,16 @@ class GamesViewModel {
     }
 
     func saveSettings() {
+        streamSettings = streamSettings.normalizedForClient
         let data = try? JSONEncoder().encode(streamSettings)
         UserDefaults.standard.set(data, forKey: "gfn.streamSettings")
     }
 
     func saveLastSession(_ record: LastSessionRecord) {
+        guard let record = record.validatedForReuse else {
+            clearLastSession()
+            return
+        }
         lastSession = record
         let data = try? JSONEncoder().encode(record)
         UserDefaults.standard.set(data, forKey: "gfn.lastSession")
@@ -492,8 +523,11 @@ class GamesViewModel {
                 autoZoneScore($1, maxPing: reachable, maxQueue: reachable, isUnlimited: isUnlimited)
             }
             .prefix(5))
-        let measuredTop = topZones
-        gamesLog.info("[Zones] top 5: \(measuredTop.map { "\($0.id) ping=\($0.pingMs!)ms queue=\($0.queuePosition)" }.joined(separator: ", "), privacy: .public)")
+        let measuredTop = topZones.compactMap { zone -> String? in
+            guard let ping = zone.pingMs else { return nil }
+            return "\(zone.id) ping=\(ping)ms queue=\(zone.queuePosition)"
+        }
+        gamesLog.info("[Zones] top 5: \(measuredTop.joined(separator: ", "), privacy: .public)")
     }
 
     func bestZoneUrl() async -> String? {
@@ -524,8 +558,8 @@ class GamesViewModel {
         let reachable = refreshed.filter { $0.pingMs != nil }
         let isUnlimited = subscription?.isUnlimited ?? false
         let best = reachable.autoZone(isUnlimited: isUnlimited)
-        if let best {
-            gamesLog.info("[Zones] best at launch: \(best.zoneUrl, privacy: .public) (ping=\(best.pingMs!, privacy: .public)ms queue=\(best.queuePosition, privacy: .public), unlimited=\(isUnlimited, privacy: .public))")
+        if let best, let ping = best.pingMs {
+            gamesLog.info("[Zones] best at launch: \(best.zoneUrl, privacy: .public) (ping=\(ping, privacy: .public)ms queue=\(best.queuePosition, privacy: .public), unlimited=\(isUnlimited, privacy: .public))")
         }
         return best?.zoneUrl
     }

@@ -5,6 +5,9 @@ import Foundation
 
 struct StreamSettings: Codable, Equatable {
     static let maxSelectableBitrateKbps = 100_000
+    static let minSelectableBitrateKbps = 15_000
+    static let minFps = 30
+    static let maxFps = 120
     static let minControllerDeadzone = 0.0
     static let maxControllerDeadzone = 0.30
     static let minRumbleIntensity = 0.0
@@ -67,6 +70,20 @@ struct StreamSettings: Codable, Equatable {
 
     var normalizedForClient: StreamSettings {
         var normalized = self
+        normalized.fps = min(max(normalized.fps, Self.minFps), Self.maxFps)
+        normalized.maxBitrateKbps = min(
+            max(normalized.maxBitrateKbps, Self.minSelectableBitrateKbps),
+            Self.maxSelectableBitrateKbps
+        )
+        normalized.rumbleIntensity = min(
+            max(normalized.rumbleIntensity, Self.minRumbleIntensity),
+            Self.maxRumbleIntensity
+        )
+        normalized.controllerDeadzone = min(
+            max(normalized.controllerDeadzone, Self.minControllerDeadzone),
+            Self.maxControllerDeadzone
+        )
+        normalized.preferredZoneUrl = CloudMatchURLBuilder.normalizedZoneURL(normalized.preferredZoneUrl)
         if !normalized.diagnosticsEnabled {
             normalized.enableRtcEventLog = false
         }
@@ -135,6 +152,7 @@ extension StreamSettings {
         appLaunchMode = try c.decodeIfPresent(AppLaunchMode.self, forKey: .appLaunchMode) ?? d.appLaunchMode
         persistInGameSettings = try c.decodeIfPresent(Bool.self, forKey: .persistInGameSettings) ?? d.persistInGameSettings
         audioFormat = try c.decodeIfPresent(AudioFormatPreference.self, forKey: .audioFormat) ?? d.audioFormat
+        self = normalizedForClient
     }
 
     func encode(to encoder: Encoder) throws {

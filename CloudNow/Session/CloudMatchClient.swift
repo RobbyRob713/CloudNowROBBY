@@ -362,6 +362,66 @@ private func hostFromResourcePath(_ resourcePath: String?) -> String? {
     return URL(string: resourcePath)?.host
 }
 
+// MARK: - CloudMatch URL Builder
+
+enum CloudMatchURLBuilder {
+    static func normalizedBase(_ raw: String) -> String? {
+        guard let components = URLComponents(string: raw),
+              components.scheme?.lowercased() == "https",
+              let host = components.host?.lowercased(),
+              !host.isEmpty
+        else {
+            return nil
+        }
+        let port = components.port.map { ":\($0)" } ?? ""
+        return "https://\(host)\(port)"
+    }
+
+    static func normalizedZoneURL(_ raw: String?) -> String? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty,
+              let base = normalizedBase(raw),
+              let host = URLComponents(string: base)?.host?.lowercased(),
+              isCloudMatchHost(host)
+        else {
+            return nil
+        }
+        return "\(base)/"
+    }
+
+    static func sessionCollectionURL(base rawBase: String, queryItems: [URLQueryItem] = []) -> URL? {
+        guard let base = normalizedBase(rawBase) else { return nil }
+        var components = URLComponents(string: base)
+        components?.path = "/v2/session"
+        components?.queryItems = queryItems.isEmpty ? nil : queryItems
+        return components?.url
+    }
+
+    static func sessionURL(base rawBase: String, sessionId: String, queryItems: [URLQueryItem] = []) -> URL? {
+        guard isPathSafe(sessionId),
+              let base = normalizedBase(rawBase)
+        else {
+            return nil
+        }
+        var components = URLComponents(string: base)
+        components?.path = "/v2/session/\(sessionId)"
+        components?.queryItems = queryItems.isEmpty ? nil : queryItems
+        return components?.url
+    }
+
+    static func isCloudMatchHost(_ host: String) -> Bool {
+        let host = host.lowercased()
+        return host == "prod.cloudmatchbeta.nvidiagrid.net" ||
+            host.hasSuffix(".cloudmatchbeta.nvidiagrid.net")
+    }
+
+    private static func isPathSafe(_ value: String) -> Bool {
+        guard !value.isEmpty else { return false }
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
+        return value.unicodeScalars.allSatisfy { allowed.contains($0) }
+    }
+}
+
 // MARK: - CloudMatchClient
 
 actor CloudMatchClient {
@@ -417,9 +477,7 @@ actor CloudMatchClient {
     func createSession(_ input: SessionCreateRequest) async throws -> SessionInfo {
         let clientId = UUID().uuidString
         let deviceId = GFNDeviceIdentity.stableDeviceId()
-        let preferredBase = input.streamingBaseUrl.map {
-            $0.hasSuffix("/") ? String($0.dropLast()) : $0
-        } ?? Self.defaultBase
+        let preferredBase = input.streamingBaseUrl.flatMap(CloudMatchURLBuilder.normalizedBase) ?? Self.defaultBase
         let fallbackBase = Self.defaultBase
         let requestedRoutingZoneUrl = normalizedRoutingZoneUrl(input.routingZoneUrl)
 
@@ -437,8 +495,10 @@ actor CloudMatchClient {
         var lastError: Error?
 
         for base in bases {
-            let params = URLComponents(string: "\(base)/v2/session")!.url!
-                .appending(queryItems: queryItems)
+            guard let params = CloudMatchURLBuilder.sessionCollectionURL(base: base, queryItems: queryItems) else {
+                lastError = CloudMatchError.sessionCreateFailed("Invalid CloudMatch URL")
+                continue
+            }
             var request = URLRequest(url: params)
             request.httpMethod = "POST"
             for (k, v) in headers {
@@ -487,7 +547,7 @@ actor CloudMatchClient {
             }
             lastError = CloudMatchError.sessionCreateFailed(raw)
         }
-        throw lastError!
+        throw lastError ?? CloudMatchError.sessionCreateFailed("No CloudMatch request was attempted.")
     }
 
     // MARK: Poll Session
@@ -502,7 +562,9 @@ actor CloudMatchClient {
         deviceId: String
     ) async throws -> SessionInfo {
         let effectiveBase = serverIp.map { "https://\($0)" } ?? base
-        let url = URL(string: "\(effectiveBase)/v2/session/\(sessionId)")!
+        guard let url = CloudMatchURLBuilder.sessionURL(base: effectiveBase, sessionId: sessionId) else {
+            throw CloudMatchError.sessionCreateFailed("Invalid poll URL")
+        }
         var request = URLRequest(url: url)
         for (k, v) in gfnHeaders(token: token, clientId: clientId, deviceId: deviceId, includeOrigin: false) {
             request.setValue(v, forHTTPHeaderField: k)
@@ -547,7 +609,9 @@ actor CloudMatchClient {
         deviceId: String? = nil
     ) async throws {
         let effectiveBase = serverIp.map { "https://\($0)" } ?? base
-        let url = URL(string: "\(effectiveBase)/v2/session/\(sessionId)")!
+        guard let url = CloudMatchURLBuilder.sessionURL(base: effectiveBase, sessionId: sessionId) else {
+            throw CloudMatchError.sessionCreateFailed("Invalid stop URL")
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "DELETE"
         let lifecycleClientId = clientId ?? UUID().uuidString
@@ -566,7 +630,9 @@ actor CloudMatchClient {
     // MARK: Active Sessions
 
     func getActiveSessions(token: String, base: String) async throws -> [ActiveSessionInfo] {
-        let url = URL(string: "\(base)/v2/session")!
+        guard let url = CloudMatchURLBuilder.sessionCollectionURL(base: base) else {
+            throw CloudMatchError.sessionCreateFailed("Invalid sessions URL")
+        }
         var request = URLRequest(url: url)
         let clientId = UUID().uuidString
         let deviceId = GFNDeviceIdentity.stableDeviceId()
@@ -657,13 +723,14 @@ actor CloudMatchClient {
 
         // Status 2 or 3: send RESUME PUT
         let resumeBase = preflight.streamingBaseUrl
-        var comps = URLComponents(string: "\(resumeBase)/v2/session/\(sessionId)")!
-        comps.queryItems = [
+        let queryItems = [
             URLQueryItem(name: "keyboardLayout", value: settings.keyboardLayout),
             URLQueryItem(name: "languageCode", value: settings.effectiveGameLanguage),
         ]
         cloudMatchLog.debug("[CloudMatch] claimSession languageCode=\(settings.effectiveGameLanguage, privacy: .public) keyboardLayout=\(settings.keyboardLayout, privacy: .public)")
-        guard let url = comps.url else { throw CloudMatchError.sessionCreateFailed("Invalid resume URL") }
+        guard let url = CloudMatchURLBuilder.sessionURL(base: resumeBase, sessionId: sessionId, queryItems: queryItems) else {
+            throw CloudMatchError.sessionCreateFailed("Invalid resume URL")
+        }
         let body: [String: Any] = [
             "action": 2,
             "data": "RESUME",
@@ -771,18 +838,7 @@ actor CloudMatchClient {
     }
 
     private func normalizedRoutingZoneUrl(_ url: String?) -> String? {
-        guard let raw = url?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty,
-              let components = URLComponents(string: raw),
-              let scheme = components.scheme?.lowercased(),
-              scheme == "https",
-              let host = components.host?.lowercased(),
-              host.hasPrefix("np-"),
-              host.hasSuffix(".nvidiagrid.net")
-        else {
-            return nil
-        }
-        return "\(scheme)://\(host)/"
+        CloudMatchURLBuilder.normalizedZoneURL(url)
     }
 
     /// Parses ad state from the raw response JSON, handling schema variations across GFN API versions.
@@ -874,7 +930,7 @@ actor CloudMatchClient {
         pausedTimeMs: Int? = nil
     ) async {
         let effectiveBase = serverIp.map { "https://\($0)" } ?? base
-        guard let url = URL(string: "\(effectiveBase)/v2/session/\(sessionId)") else { return }
+        guard let url = CloudMatchURLBuilder.sessionURL(base: effectiveBase, sessionId: sessionId) else { return }
         var adUpdate: [String: Any] = [
             "adId": adId,
             "adAction": action.rawValue,
