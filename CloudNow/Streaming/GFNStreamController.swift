@@ -83,6 +83,7 @@ struct StreamStats {
     var inputQueueMaxMs: Double = 0
     var newestGamepadAgeMs: Double = 0
     var inputChannelState: String = "closed"
+    var gamepadSnapshotTransport: String = "reliable"
     /// Average FPS the game renders on the cloud rig, from the server's stats_channel
     /// messages (0 until the first message arrives). The official client shows this
     /// alongside the stream FPS.
@@ -220,6 +221,7 @@ final class GFNStreamController: NSObject {
     @ObservationIgnored private nonisolated(unsafe) var inputQueueMaxNs: UInt64 = 0
     @ObservationIgnored private nonisolated(unsafe) var newestGamepadGeneratedAt: UInt64 = 0
     @ObservationIgnored private nonisolated(unsafe) var inputChannelState = "closed"
+    @ObservationIgnored private nonisolated(unsafe) var gamepadSnapshotTransport = "reliable"
     @ObservationIgnored private nonisolated(unsafe) var pendingGamepadSnapshots: [
         Int: (packet: EncodedInputPacket, completion: (InputSendDisposition) -> Void)
     ] = [:]
@@ -235,7 +237,7 @@ final class GFNStreamController: NSObject {
     private(set) var remoteMode: RemoteInputMode = .mouse
     private var statsTimer: Timer?
     private var videoReceiver: LKRTCRtpReceiver?
-    private var protocolVersion = 2
+    @ObservationIgnored private nonisolated(unsafe) var protocolVersion = 2
     private var partialReliableThresholdMs = 300
     private var sessionInfo: SessionInfo?
     private var settings = StreamSettings()
@@ -244,7 +246,7 @@ final class GFNStreamController: NSObject {
     private var micAudioSource: LKRTCAudioSource?
     private var micAudioTrack: LKRTCAudioTrack?
     private var signalingComplete = false
-    private var partiallyReliableDataChannel: LKRTCDataChannel?
+    @ObservationIgnored private nonisolated(unsafe) var partiallyReliableDataChannel: LKRTCDataChannel?
     private var statsChannel: LKRTCDataChannel?
     private var controlChannel: LKRTCDataChannel?
     private var inputReady = false
@@ -334,6 +336,7 @@ final class GFNStreamController: NSObject {
             inputQueueMaxNs = 0
             newestGamepadGeneratedAt = 0
             inputChannelState = "closed"
+            gamepadSnapshotTransport = "reliable"
         }
 
         setupSignaling(session: session)
@@ -621,13 +624,13 @@ final class GFNStreamController: NSObject {
                     mode: .voiceChat,
                     options: [.allowBluetoothHFP, .allowBluetoothA2DP]
                 )
-                try audioSession.setPreferredIOBufferDuration(0.01)
+                try audioSession.setPreferredIOBufferDuration(0.005)
                 try audioSession.setActive(true)
                 guard audioSession.isInputAvailable else {
                     gfnLog.warning("[Stream] AVAudioSession has no input route, falling back to playback")
                     return configurePlaybackAudioSession(audioSession)
                 }
-                gfnLog.info("[Stream] AVAudioSession configured for playback + microphone")
+                gfnLog.info("[Stream] AVAudioSession configured for playback + microphone; voiceChat/Bluetooth mic routing can increase latency")
                 logAudioSessionConfiguration(audioSession)
                 return true
             } catch {
@@ -647,7 +650,7 @@ final class GFNStreamController: NSObject {
             // = 100 ms device playout delay over HDMI), which puts game audio ~100 ms behind
             // our zero-buffer video. A short preferred IO buffer keeps the render quantum small.
             try audioSession.setCategory(.playback, mode: .default, options: [])
-            try audioSession.setPreferredIOBufferDuration(0.01)
+            try audioSession.setPreferredIOBufferDuration(0.005)
             try audioSession.setActive(true)
             gfnLog.info("[Stream] AVAudioSession configured for playback")
             logAudioSessionConfiguration(audioSession)
@@ -751,6 +754,7 @@ final class GFNStreamController: NSObject {
         prConfig.isNegotiated = false
         if let dc = pc.dataChannel(forLabel: "input_channel_partially_reliable", configuration: prConfig) {
             partiallyReliableDataChannel = dc
+            dc.delegate = self
         }
 
         // Server performance stats (game FPS, server RTD) arrive as binary messages
@@ -1178,6 +1182,7 @@ final class GFNStreamController: NSObject {
             let bufferedBytes = inputBufferedBytes
             let maxNs = inputQueueMaxNs
             let channelState = inputChannelState
+            let transport = gamepadSnapshotTransport
             inputQueueWaitsNs.removeAll(keepingCapacity: true)
             inputQueueMaxNs = 0
 
@@ -1193,6 +1198,7 @@ final class GFNStreamController: NSObject {
                 stats.inputQueueMaxMs = Double(maxNs) / 1_000_000
                 stats.newestGamepadAgeMs = Double(gamepadAgeNs) / 1_000_000
                 stats.inputChannelState = channelState
+                stats.gamepadSnapshotTransport = transport
             }
         }
     }
@@ -1748,15 +1754,27 @@ extension GFNStreamController: LKRTCDataChannelDelegate {
                 }
             }
         }
+        if dataChannel.label == "input_channel_partially_reliable" {
+            inputSendQueue.async { [weak self] in
+                guard let self else { return }
+                if dataChannel.readyState == .open, protocolVersion >= 3 {
+                    updateGamepadSnapshotTransport("partially reliable")
+                    drainPendingGamepadSnapshotsIfPossible(on: dataChannel)
+                } else if gamepadSnapshotTransport == "partially reliable" {
+                    updateGamepadSnapshotTransport("reliable")
+                }
+                updateInputBufferedBytes()
+            }
+        }
         // InputSender is NOT started here — it starts only after the server sends its
         // handshake message on input_channel_v1 (handled in dataChannel(_:didReceiveMessageWith:))
     }
 
     nonisolated func dataChannel(_ dataChannel: LKRTCDataChannel, didChangeBufferedAmount amount: UInt64) {
-        guard dataChannel.label == "input_channel_v1" else { return }
+        guard dataChannel.label == "input_channel_v1" || dataChannel.label == "input_channel_partially_reliable" else { return }
         inputSendQueue.async { [weak self] in
             guard let self else { return }
-            inputBufferedBytes = amount
+            updateInputBufferedBytes(fallbackAmount: amount)
             drainPendingGamepadSnapshotsIfPossible(on: dataChannel)
         }
     }
@@ -1892,11 +1910,12 @@ extension GFNStreamController: DataChannelSender {
             }
             inputGenerated &+= 1
 
-            guard let dc = reliableSendChannel, dc.readyState == .open else {
+            guard let reliableChannel = reliableSendChannel, reliableChannel.readyState == .open else {
                 inputDropped &+= 1
                 completion(.channelUnavailable)
                 return
             }
+            let sendChannel = channelForInputPacket(packet, reliableChannel: reliableChannel)
 
             if let slot = packet.gamepadSlot {
                 if let pending = pendingGamepadSnapshots.removeValue(forKey: slot) {
@@ -1904,16 +1923,34 @@ extension GFNStreamController: DataChannelSender {
                     pending.completion(.superseded)
                 }
                 if packet.isReplaceableGamepadSnapshot,
-                   dc.bufferedAmount > inputBackpressureHighWaterBytes
+                   sendChannel.bufferedAmount > inputBackpressureHighWaterBytes
                 {
                     pendingGamepadSnapshots[slot] = (packet, completion)
                     return
                 }
             }
 
-            sendImmediately(packet, completion: completion, on: dc)
-            drainPendingGamepadSnapshotsIfPossible(on: dc)
+            sendImmediately(packet, completion: completion, on: sendChannel)
+            drainPendingGamepadSnapshotsIfPossible(on: sendChannel)
         }
+    }
+
+    private nonisolated func channelForInputPacket(
+        _ packet: EncodedInputPacket,
+        reliableChannel: LKRTCDataChannel
+    ) -> LKRTCDataChannel {
+        guard packet.isReplaceableGamepadSnapshot,
+              protocolVersion >= 3,
+              let partialChannel = partiallyReliableDataChannel,
+              partialChannel.readyState == .open
+        else {
+            if packet.category == .gamepadSnapshot {
+                updateGamepadSnapshotTransport("reliable")
+            }
+            return reliableChannel
+        }
+        updateGamepadSnapshotTransport("partially reliable")
+        return partialChannel
     }
 
     private nonisolated func sendImmediately(
@@ -1940,7 +1977,7 @@ extension GFNStreamController: DataChannelSender {
             inputSubmitted &+= 1
             accepted = dataChannel.sendData(buffer)
         }
-        inputBufferedBytes = dataChannel.bufferedAmount
+        updateInputBufferedBytes()
         if accepted {
             inputAccepted &+= 1
             completion(.accepted)
@@ -1956,8 +1993,27 @@ extension GFNStreamController: DataChannelSender {
         for slot in pendingGamepadSnapshots.keys.sorted() {
             guard dataChannel.bufferedAmount <= inputBackpressureHighWaterBytes,
                   let pending = pendingGamepadSnapshots.removeValue(forKey: slot) else { break }
-            sendImmediately(pending.packet, completion: pending.completion, on: dataChannel)
+            let reliableChannel = reliableSendChannel ?? dataChannel
+            let sendChannel = channelForInputPacket(pending.packet, reliableChannel: reliableChannel)
+            guard sendChannel.readyState == .open else {
+                inputDropped &+= 1
+                pending.completion(.channelUnavailable)
+                continue
+            }
+            sendImmediately(pending.packet, completion: pending.completion, on: sendChannel)
         }
+    }
+
+    private nonisolated func updateInputBufferedBytes(fallbackAmount: UInt64 = 0) {
+        let reliableBytes = reliableSendChannel?.bufferedAmount ?? 0
+        let partialBytes = partiallyReliableDataChannel?.bufferedAmount ?? 0
+        inputBufferedBytes = max(fallbackAmount, reliableBytes + partialBytes)
+    }
+
+    private nonisolated func updateGamepadSnapshotTransport(_ transport: String) {
+        guard gamepadSnapshotTransport != transport else { return }
+        gamepadSnapshotTransport = transport
+        gfnLog.info("[Input] replaceable gamepad snapshots using \(transport, privacy: .public) transport")
     }
 }
 

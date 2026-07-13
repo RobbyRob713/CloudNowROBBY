@@ -61,6 +61,7 @@ struct StatsHUDView: View {
     // MARK: Standard
 
     @ViewBuilder private var standardSections: some View {
+        latencySection
         networkSection
         videoSection
         audioSection
@@ -68,6 +69,31 @@ struct StatsHUDView: View {
         if streamController.diagnosticsEnabled {
             debugSection
         }
+    }
+
+    @ViewBuilder private var latencySection: some View {
+        let stats = streamController.stats
+        let audio = streamController.audioStats
+        header(L10n.text("latency"))
+        row(
+            L10n.text("audio_jitter"),
+            "\(Int(audio.jitterBufferCurrentMs)) / \(Int(audio.jitterBufferTargetMs)) ms"
+        )
+        row(L10n.text("output_latency"), String(format: "%.0f ms", audio.outputLatencyMs))
+        row(
+            L10n.text("input"),
+            String(
+                format: "%llu B · p95 %.1f / max %.1f ms",
+                stats.inputBufferedBytes,
+                stats.inputQueueP95Ms,
+                stats.inputQueueMaxMs
+            )
+        )
+        row(L10n.text("gamepad_transport"), stats.gamepadSnapshotTransport)
+        row(
+            L10n.text("network"),
+            "\(Int(stats.rttMs)) ms · \(L10n.text(stats.selectedNetworkPath))"
+        )
     }
 
     @ViewBuilder private var networkSection: some View {
@@ -150,6 +176,7 @@ struct StatsHUDView: View {
             String(format: "%.1f / %.1f ms", stats.inputQueueP95Ms, stats.inputQueueMaxMs)
         )
         row(L10n.text("input_buffer"), "\(stats.inputBufferedBytes) B (\(stats.inputChannelState))")
+        row(L10n.text("gamepad_transport"), stats.gamepadSnapshotTransport)
         if !stats.decoderImplementation.isEmpty {
             let hardware = stats.powerEfficientDecoder == true ? " (\(L10n.text("hardware")))" : ""
             row(L10n.text("decoder"), stats.decoderImplementation + hardware)

@@ -26,7 +26,7 @@ struct StreamSettings: Codable, Equatable {
     var colorPreference: ColorModePreference = .automatic
     var keyboardLayout: String = Self.defaultKeyboardLayout
     var gameLanguage: String = Self.defaultGameLanguage
-    var enableL4S: Bool = false
+    var enableL4S: Bool = true
     var micEnabled: Bool = false
     var rumbleEnabled: Bool = true
     /// Rumble power multiplier (0.0–2.0, 1.0 = default). Higher stresses controller motors.
@@ -66,7 +66,7 @@ struct StreamSettings: Codable, Equatable {
     var persistInGameSettings: Bool = true
     /// Requested audio channel layout. Automatic follows the connected audio system's
     /// capability (5.1 only when the route reports ≥6 output channels).
-    var audioFormat: AudioFormatPreference = .automatic
+    var audioFormat: AudioFormatPreference = .stereo
 
     var normalizedForClient: StreamSettings {
         var normalized = self

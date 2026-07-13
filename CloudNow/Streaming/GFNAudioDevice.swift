@@ -60,7 +60,7 @@ final class GFNAudioDevice: NSObject {
         let routeMax = max(1, session.maximumOutputNumberOfChannels)
         do {
             try session.setPreferredOutputNumberOfChannels(min(wanted, routeMax))
-            try session.setPreferredIOBufferDuration(0.01)
+            try session.setPreferredIOBufferDuration(0.005)
         } catch {
             audioDeviceLog.error("preferred output configuration failed: \(error, privacy: .private)")
         }

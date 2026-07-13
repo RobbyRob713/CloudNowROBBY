@@ -12,6 +12,12 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section(L10n.text("stream_quality")) {
+                    Button {
+                        applyLowLatencyPreset(to: vm)
+                    } label: {
+                        Label(L10n.text("low_latency_preset"), systemImage: "bolt.fill")
+                    }
+
                     Picker(L10n.text("resolution"), selection: $vm.streamSettings.resolution) {
                         let common = commonResolutions.filter { viewModel.availableResolutions.contains($0.res) }
                         let other = viewModel.availableResolutions.filter { res in !commonResolutions.map(\.res).contains(res) }
@@ -397,6 +403,20 @@ struct SettingsView: View {
         // Extract zone ID from URL like "https://np-aws-us-n-virginia-1.cloudmatchbeta.nvidiagrid.net/"
         let host = URL(string: url)?.host ?? url
         return host.components(separatedBy: ".").first?.uppercased() ?? url
+    }
+
+    private func applyLowLatencyPreset(to vm: GamesViewModel) {
+        if viewModel.availableResolutions.contains("1920x1080") {
+            vm.streamSettings.resolution = "1920x1080"
+        }
+        if viewModel.availableFps.contains(60) {
+            vm.streamSettings.fps = 60
+        }
+        vm.streamSettings.maxBitrateKbps = 20_000
+        vm.streamSettings.codec = .h264
+        vm.streamSettings.audioFormat = .stereo
+        vm.streamSettings.micEnabled = false
+        vm.streamSettings.enableL4S = true
     }
 
     private struct ResolutionEntry { let res: String; let badge: String; let symbol: String }
